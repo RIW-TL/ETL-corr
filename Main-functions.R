@@ -278,7 +278,8 @@ fit.ETL.corr = function(Xt, XS, A, M, R_t_hat, R_s_hat, pre) {
       R_trans[l, j] <- R_trans[j, l]
     }
   }
-  
+
+  R_trans = fit.def.sym(R_trans)
   return(R_trans)
 }
 
@@ -440,6 +441,7 @@ fit.ETL.var = function(Xt,XS,A1,M1,A2,M2){
   
   return(ETL.var.hat)
 }
+
 
 
 
