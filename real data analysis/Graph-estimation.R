@@ -9,15 +9,37 @@ library(moments)
 source("Functions of Trans-CLIME.R")
 source("Main-functions.R")
 source("stock-data-process.R")
+#-----------------------------------------------
+
+# All data is utilized to estimate the graphs
+Yt = scale(Xt,center = TRUE,scale = TRUE)
+K = 1;p = ncol(XS);n1 = nrow(XS) 
+YS = array(0,c(n1,p,K))
+YS[,,1] = scale(XS,center = TRUE,scale = TRUE)
 
 ## Target-Glasso
 ##------------------------------------------------------------
 #-------------------------------------------------------------
 sam.cov = cov(Yt)
 
-rho.list = seq(0.005,0.1,0.005)
+rho.list = seq(0.01,0.1,0.01)
 fit = CVglasso(Yt, sam.cov, K = 5, trace = "none", lam = rho.list)
-Ome_target_hat = fit$Ome_hat
+Ome_target_hat = fit$Omega
+
+## Pool-Glasso
+#-------------------------------------------------
+#-------------------------------------------------
+sum.X = Yt
+for (k in 1:K) {
+  
+  sum.X = rbind(sum.X,YS[,,k])
+}
+sam.pool = cov(sum.X)
+
+rho.list = seq(0.01,0.1,0.01)
+fit = CVglasso(Yt, sam.pool, K = 5, trace = "none", lam = rho.list)
+Pool_Glasso_hat = fit$Omega
+
 
 # ETL-Glasso 
 ##------------------------------------------------------------
@@ -26,10 +48,10 @@ Ome_target_hat = fit$Ome_hat
 #------------------
 R_t_hat = cor(Yt)
 R_s_hat = array(0,c(p,p,K))
-for (k in 1:K) {R_s_hat[,,k] = cor(YS[[k]])}
+for (k in 1:K) {R_s_hat[,,k] = cor(YS[,,1])}
 
 pre = pre_compute(Yt, YS, R_t_hat, R_s_hat)
-ETL_corr_hat = fit.ETL.corr(Yt, YS, A = 0.5, M = 0.4, R_t_hat, R_s_hat,pre)
+ETL_corr_hat = fit.ETL.corr(Yt, YS, A = 0.5, M = 0.5, R_t_hat, R_s_hat,pre)
 
 # Step 2: ETL-var
 #-------------------------------
@@ -41,24 +63,10 @@ ETL_cov_hat = diag(ETL.var.hat^{1/2}) %*% ETL_corr_hat %*% diag(ETL.var.hat^{1/2
 
 # Step 4: precision matrix estimation
 #----------------------------------
-lam = seq(0.002,0.01,0.002)
-fit = CVglasso(Xt, S = ETL_cov_hat, K = 5, trace = "none", lam = lam)
-ETL_glasso_hat = fit$Omega 
-
-
-## Pool-Glasso
-#-------------------------------------------------
-#-------------------------------------------------
-sum.X = Yt
-for (k in 1:K) {
-  
-  sum.X = rbind(sum.X,YS[[k]])
-}
-sam.pool = cov(sum.X)
-
-rho.list = seq(0.01,0.1,0.01)
-fit = CVglasso(Yt, sam.pool, K = 5, trace = "none", lam = rho.list)
-Pool_Glasso_hat = fit$Omega
+lam = seq(0.05,0.15,0.01)
+fit = CVglasso(Yt, S = ETL_cov_hat, K = 5, trace = "none", lam = lam)
+ETL_glasso_hat = fit$Omega
+ETL_glasso_hat[which(abs(ETL_glasso_hat) < 10^{-3})] = 0
 
 
 # CLIME
@@ -130,3 +138,7 @@ edge.detect.result[4,] = c(a$density.in, a$density.cross)
 
 a = edge(Omega.trans.clime.hat)
 edge.detect.result[5,] = c(a$density.in, a$density.cross)
+
+edge.detect.result
+
+
