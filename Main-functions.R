@@ -1,447 +1,761 @@
-library(mvtnorm)
 library(ks)
-library(Matrix)
-library(sparseCov)
-library(moments)
-#----------------------------------------------------
+library(parallel)
 
-# symmetrization and positive definitization
-fit.def.sym = function(Sig){
-  
-  p = dim(Sig)[2]
-  eigen_decomp = eigen(Sig)
-  eigenvalues = eigen_decomp$values
-  
-  if(min(eigenvalues) >= 0.1){
-    
-    Sig = Sig
-  }else{
-    
-    c = 0.1 - min(eigenvalues)
-    Sig = Sig + c*diag(1,p)
-  }
-  
-  Sig[abs(Sig)< 10^{-10}] = 0
-  
-  Sig = (Sig + t(Sig))/2
-  return(Sig)
-}
+#============================================================
+# 1. ETL-corr for a grid of M. Parallelization only over (j,l)
+#============================================================
 
-## data generation 
-# num.info: the size of informative sources
-# d: informative level
-# s: sparsity level
-dat.g = function(n0,n1,p,num.info,K,d,case,s){
+fit.ETL.corr <- function(
+    X0,
+    XS,
+    c_A1 = 0.4,
+    c_A2 = 0.95,
+    M = 0.3,
+    c_H = 1,
+    density_floor = 1e-10,
+    ncores = 8,
+    cl = NULL) {
   
-  ## parameter generation
-  ##---------------------------------------
+  p <- ncol(X0)
+  K <- length(XS)
   
-  # target covariance matrix (two settings)
-  if(case == 1){
-    
-    Sig_t = diag(1,p)
-    
-    for (j in 1:(p - 1)) {
-      for (l in (j + 1):p) {
-        
-        Sig_t[j,l] = 0.7^{abs(j - l)}
-        Sig_t[l,j] = Sig_t[j,l]
-      }
-    }
-    
-    Sig_t = fit.def.sym(Sig_t) 
-    
-  }else{
-    
-    # target precision matrix
-    B = matrix(0, nrow = p, ncol = p)
-    for (i in 1:p) {
-      for (j in i:p) {
-        
-        if(i == j){
-          
-          B[i, j] = 1 + runif(1, 0, 0.2)
-          
-        }else {
-          
-          value = runif(1, 0, 0.2)
-          B[i, j] <- value
-          B[j, i] <- value
-        }
-      }
-    }
-    
-    B = (B + t(B))/2
-    
-    # generate a sparse covariance matrix. Each column remains s elements. 
-    if(s < p){
-      
-      for(j in 1:p){
-        
-        B[,j]<-B[,j]*(abs(B[,j])>=quantile(abs(B[,j]),1-s/p))
-        B[j,]<-B[j,]*(abs(B[j,])>=quantile(abs(B[j,]),1-s/p))
-      }
-    }
-    
-    
-    Sig_t = fit.def.sym(B) 
-  }
+  #==========================================================
+  # Initial estimators
+  #==========================================================
   
-  # source covariance matrices
-  Sig_s = array(0,c(p,p,K))
-  
-  fit = eigen(Sig_t)
-  U = fit$vectors
-  Lambda.T = fit$values
-  
+  R_t_initial <- fit.domain.scor(X0, corr = TRUE)
+  R_s_initial <- list()
   for (k in 1:K) {
-    
-    if(k <= num.info){
-      
-      Lambda.S = Lambda.T + runif(p,min = 0,max = 0.2)
-      
-      US1 = U + matrix(runif(p^2,0,d/p),p)
-      qr_result = qr(US1)
-      US1 = qr.Q(qr_result)
-      
-      Sig_s[,,k] = US1 %*% diag(Lambda.S) %*% t(US1)
-    }else{
-      
-      Lambda.S = Lambda.T + runif(p,min = 1,max = 2)
-      
-      US2 = U + matrix(runif(p^2,0.5,1),p)
-      qr_result = qr(US2)
-      US2 = qr.Q(qr_result)
-      
-      Sig_s[,,k] = US2 %*% diag(Lambda.S) %*% t(US2)
-    }
-    
-    Sig_s[,,k] = (Sig_s[,,k] + t(Sig_s[,,k]))/2
-    
+    R_s_initial[[k]] = fit.domain.scor(XS[[k]], corr = TRUE)
   }
-  
-  ## data generation
-  ##-----------------------------------------------
-  
-  # Gaussian 
-  Xt = rmvnorm(n0,rep(0,p),Sig_t)
-  XS = array(0,c(n1,p,K))
-  for (k in 1:K) {XS[,,k] = rmvnorm(n1,rep(0,p),Sig_s[,,k])}
-  
-  # # non-Guassian
-  # Zt = matrix(0,n0,p)
-  # 
-  # Zt[,1] = rchisq(n0,df = 5)
-  # Zt[,2] = rt(n0,df = 5)
-  # Zt[,3] = runif(n0,min = -1,max = 1)
-  # 
-  # for(j in 4:p){Zt[,j] = rnorm(n0)}
-  # 
-  # eig <- eigen(Sig_t)
-  # Q <- eig$vectors
-  # Lambda <- diag(eig$values)
-  # Lambda_sqrt <- diag(sqrt(eig$values))
-  # Sig_t_sqrt <- Q %*% Lambda_sqrt %*% t(Q)
-  # 
-  # Xt = Zt %*% Sig_t_sqrt
-  
-  # XS = array(0,c(n1,p,K))
-  # ZS = array(0,c(n1,p,K))
-  # 
+  # R_s_initial <- R_s_true
+  # R_t_initial <- cor(X0)
+  # R_s_initial <- list()
   # for (k in 1:K) {
-  #   
-  #   ZS[,1,k] = rchisq(n1,df = 5)
-  #   ZS[,2,k] = rt(n1,df = 5)
-  #   ZS[,3,k] = runif(n1,min = -1,max = 1)
-  #   
-  #   for(j in 4:p){ZS[,j,k] = rnorm(n1)}
-  #   
-  #   eig <- eigen(Sig_s[,,k])
-  #   Q <- eig$vectors
-  #   Lambda <- diag(eig$values)
-  #   Lambda_sqrt <- diag(sqrt(eig$values))
-  #   Sig_k_sqrt <- Q %*% Lambda_sqrt %*% t(Q)
-  #   
-  #   XS[,,k] = ZS[,,k] %*% Sig_k_sqrt
+  #   R_s_initial[[k]] = cor(XS[[k]])
   # }
-
-  return(list(Xt = Xt, XS = XS, 
-              Sig_t = Sig_t, Sig_s = Sig_s))
+  
+  #==========================================================
+  # Standardization
+  #==========================================================
+  
+  Y0 <- scale(X0)
+  YS <- lapply(XS, scale)
+  
+  pair_id <- which(
+    lower.tri(matrix(0, p, p)),
+    arr.ind = TRUE
+  )
+  
+  target_cross <- crossprod(Y0)
+  
+  
+  #==========================================================
+  # Precompute A2
+  #
+  # A2 depends only on source k and coordinate l,
+  # not on j, so it should NOT be recomputed for every pair.
+  #==========================================================
+  
+  A2_list <- lapply(
+    YS,
+    function(Yk) {
+      apply(
+        abs(Yk),
+        2,
+        quantile,
+        probs = c_A2,
+        names = FALSE
+      )
+    }
+  )
+  
+  
+  #==========================================================
+  # One pair
+  #==========================================================
+  
+  fit_one_pair <- function(ii) {
+    
+    j <- pair_id[ii, 1]
+    l <- pair_id[ii, 2]
+    
+    #--------------------------------------------------------
+    # Target contribution
+    #--------------------------------------------------------
+    
+    num <- target_cross[l, j]
+    den <- target_cross[l, l]
+    
+    
+    #========================================================
+    # Sources
+    #========================================================
+    
+    for (k in seq_len(K)) {
+      
+      yj <- YS[[k]][, j]
+      yl <- YS[[k]][, l]
+      
+      nk <- length(yl)
+      
+      rho_t <- R_t_initial[j, l]
+      rho_s <- R_s_initial[[k]][j, l]
+      
+      
+      #------------------------------------------------------
+      # Residuals
+      #------------------------------------------------------
+      
+      error_1 <- yj - rho_s * yl
+      error_0 <- yj - rho_t * yl
+      
+      delta_abs <- abs(
+        (rho_s - rho_t) * yl
+      )
+      
+      
+      #------------------------------------------------------
+      # Sample selection
+      #------------------------------------------------------
+      
+      A1 <- as.numeric(
+        quantile(
+          abs(error_1),
+          probs = c_A1,
+          names = FALSE
+        )
+      )
+      
+      # Precomputed
+      A2 <- A2_list[[k]][l]
+      
+      id <-
+        abs(error_1) <= A1 &
+        abs(yl) <= A2 &
+        delta_abs <= M
+      
+      
+      #------------------------------------------------------
+      # Skip KDE if nothing is selected
+      #------------------------------------------------------
+      
+      if (!any(id))
+        next
+      
+      id_sel <- which(id)
+      m <- length(id_sel)
+      
+      
+      #------------------------------------------------------
+      # KDE training sample
+      #------------------------------------------------------
+      
+      Z <- cbind(
+        error_1,
+        yl
+      )
+      
+      
+      #------------------------------------------------------
+      # Bandwidth matrix
+      #
+      # Because Y_j and Y_l are standardized and rho_s is
+      # their sample correlation:
+      #
+      # Var(error_1) = 1 - rho_s^2
+      # Cov(error_1, yl) = 0
+      # Var(yl) = 1
+      #
+      # Therefore cov(Z) need not be recomputed.
+      #------------------------------------------------------
+      
+      H <-
+        c_H *
+        nk^(-1 / 3) *
+        diag(
+          c(
+            max(1 - rho_s^2, 1e-8),
+            1
+          )
+        )
+      
+      H <- H + 1e-8 * diag(2)
+      
+      
+      #------------------------------------------------------
+      # Evaluate KDE ONLY at selected observations
+      #------------------------------------------------------
+      
+      eval_points <- rbind(
+        cbind(
+          error_1[id_sel],
+          yl[id_sel]
+        ),
+        cbind(
+          error_0[id_sel],
+          yl[id_sel]
+        ),
+        cbind(
+          -error_0[id_sel],
+          yl[id_sel]
+        )
+      )
+      
+      kde_fit <- ks::kde(
+        x = Z,
+        H = H,
+        eval.points = eval_points,
+        binned = TRUE,
+        bgridsize = c(41, 41),
+        compute.cont = FALSE
+      )
+      
+      f_all <- as.numeric(
+        kde_fit$estimate
+      )
+      
+      ii_sel <- seq_len(m)
+      
+      #------------------------------------------------------
+      # Density ratio
+      #------------------------------------------------------
+      
+      f_den <- f_all[ii_sel]
+      
+      f_num1 <- f_all[
+        m + ii_sel
+      ]
+      
+      f_num2 <- f_all[
+        2 * m + ii_sel
+      ]
+      
+      f_den <- pmax(
+        f_den,
+        density_floor
+      )
+      
+      weight <-
+        (f_num1 + f_num2) /
+        (2 * f_den)
+      
+      
+      #------------------------------------------------------
+      # Weighted source contribution
+      #------------------------------------------------------
+      
+      num <- num +
+        sum(
+          weight *
+            yj[id_sel] *
+            yl[id_sel]
+        )
+      
+      den <- den +
+        sum(
+          weight *
+            yl[id_sel]^2
+        )
+    }
+    
+    
+    list(
+      rho = num / den,
+      H = den
+    )
+  }
+  
+  
+  #==========================================================
+  # Parallel cluster
+  #==========================================================
+  
+  own_cluster <- FALSE
+  
+  if (is.null(cl) && ncores > 1L) {
+    
+    cl <- parallel::makeCluster(
+      ncores
+    )
+    
+    user_lib <- path.expand(
+      "~/R/library"
+    )
+    
+    parallel::clusterCall(
+      cl,
+      function(lib) {
+        .libPaths(
+          c(lib, .libPaths())
+        )
+        invisible(NULL)
+      },
+      user_lib
+    )
+    
+    own_cluster <- TRUE
+  }
+  
+  on.exit(
+    {
+      if (own_cluster &&
+          !is.null(cl)) {
+        
+        parallel::stopCluster(cl)
+      }
+    },
+    add = TRUE
+  )
+  
+  
+  #==========================================================
+  # Parallelization over pairs
+  #==========================================================
+  
+  if (is.null(cl)) {
+    
+    pair_fit <- lapply(
+      seq_len(nrow(pair_id)),
+      fit_one_pair
+    )
+    
+  } else {
+    
+    parallel::clusterExport(
+      cl,
+      varlist = c(
+        "YS",
+        "R_t_initial",
+        "R_s_initial",
+        "pair_id",
+        "target_cross",
+        "A2_list",
+        "K",
+        "c_A1",
+        "M",
+        "c_H",
+        "density_floor",
+        "fit_one_pair"
+      ),
+      envir = environment()
+    )
+    
+    pair_fit <- parallel::parLapply(
+      cl,
+      seq_len(nrow(pair_id)),
+      fit_one_pair
+    )
+  }
+  
+  
+  #==========================================================
+  # Collect
+  #==========================================================
+  
+  rho_pair <- vapply(
+    pair_fit,
+    `[[`,
+    numeric(1),
+    "rho"
+  )
+  
+  H_pair <- vapply(
+    pair_fit,
+    `[[`,
+    numeric(1),
+    "H"
+  )
+  
+  
+  #==========================================================
+  # Correlation matrix
+  #==========================================================
+  
+  R_hat <- diag(p)
+  
+  for (ii in seq_len(nrow(pair_id))) {
+    
+    j <- pair_id[ii, 1]
+    l <- pair_id[ii, 2]
+    
+    R_hat[j, l] <- rho_pair[ii]
+    R_hat[l, j] <- rho_pair[ii]
+  }
+  
+  
+  #==========================================================
+  # Minimum denominator
+  #==========================================================
+  
+  H_min <- min(H_pair)
+  
+  
+  list(
+    R_hat = R_hat,
+    H_min = H_min,
+    rho_pair = rho_pair,
+    H_pair = H_pair,
+    pair_id = pair_id
+  )
 }
 
-# Main function in implementing ETL-corr
-pre_compute = function(Xt, XS, R_t_hat, R_s_hat) {
+
+fit.ETL.corr.cv <- function(
+    X0,
+    XS,
+    c_A1 = 0.8,
+    c_A2 = 0.95,
+    M_grid = c(0.3, 0.6, 0.9),
+    c_H = 1,
+    density_floor = 1e-10,
+    ncores = 8,
+    cl = NULL,
+    cv_folds = 5) {
   
-  p = dim(Xt)[2]
-  n1 = dim(XS)[1]
-  K = dim(XS)[3]
-  
-  # Step 1: data normaliation  
-  #---------------------------------------
-  Yt <- scale(Xt)
-  YS <- array(0, c(n1, p, K))
-  for (k in 1:K) {
-    YS[,,k] <- scale(XS[,,k])
+  M_grid <- sort(unique(M_grid))
+  if (anyNA(M_grid) || !length(M_grid) || any(M_grid < 0)) {
+    stop("M_grid must contain nonnegative finite values.")
   }
-  
-  # List for storing precomputed results
-  pre <- list()
-  
-  pre$Yt_cross <- matrix(0, p, p)
-  for (j in 1:p) {
-    for (l in 1:p) {
-      pre$Yt_cross[j, l] <- sum(Yt[, j] * Yt[, l])
-    }
+  if (any(!is.finite(M_grid))) {
+    stop("M_grid must contain finite values.")
   }
-  
-  # Precompute the error term, KDE result and weight for each (j, l, k)
-  pre$errors <- array(list(), dim = c(p, p, K))  
-  pre$weights <- array(0, dim = c(n1, K, p, p)) 
-  
-  for (j in 1:(p - 1)) {
-    for (l in (j + 1):p) {
-      
-      for (k in 1:K) {
-        
-        eta <- (R_t_hat[j, l] - R_s_hat[j, l, k]) * YS[, l, k]
-        error_0 <- YS[, j, k] - R_t_hat[j, l] * YS[, l, k]
-        error_1 <- YS[, j, k] - R_s_hat[j, l, k] * YS[, l, k]
-        pre$errors[[j, l, k]] <- list(eta = eta, error_0 = error_0, error_1 = error_1)
-        
-        # kernel density estimation (one-dimensional density ratio)
-        kde.fit <- kde(x = error_1)
-        fenzi <- (predict(kde.fit, x = error_0) + predict(kde.fit, x = -error_0)) / 2
-        fenmu <- predict(kde.fit, x = error_1)
-        
-        # # kernel density estimation (two-dimensional density ratio)
-        # fenzi = dnorm(error_0)
-        # 
-        # fit_joint <- kde(x = YS[, c(j,l),k])
-        # fenmu.fenzi <- predict(fit_joint, x = YS[, c(j,l), k])
-        # 
-        # fit_marginal <- kde(x = YS[, l, k])
-        # fenmu.fenmu <- predict(fit_marginal, x = YS[, l, k])
-        # fenmu = fenmu.fenzi/fenmu.fenmu
-
-        
-        pre$weights[, k, j, l] <- fenzi / fenmu  
-      }
-    }
+  if (length(cv_folds) != 1L || is.na(cv_folds) ||
+      cv_folds < 2L || cv_folds != as.integer(cv_folds) ||
+      cv_folds >= nrow(X0)) {
+    stop("cv_folds must be an integer between 2 and nrow(X0)-1.")
   }
+  cv_folds <- as.integer(cv_folds)
   
-  return(pre)
-}
-
-fit.ETL.corr = function(Xt, XS, A, M, R_t_hat, R_s_hat, pre) {
+  p <- ncol(X0)
+  K <- length(XS)
+  nM <- length(M_grid)
+  max_M <- max(M_grid)
   
-  n0 <- dim(Xt)[1]
-  p <- dim(Xt)[2]
-  n1 <- dim(XS[,,1])[1]
-  K = dim(XS)[3]
+  #==========================================================
+  # Initial estimators (full data)
+  #==========================================================
+  R_t_initial <- fit.domain.scor(X0, corr = TRUE)
+  R_s_initial <- lapply(XS, function(Xk) {
+    fit.domain.scor(Xk, corr = TRUE)
+  })
   
-  # Step 1: data normaliation  
-  #---------------------------------------
-  Yt <- scale(Xt)
-  YS <- array(0, c(n1, p, K))
-  for (k in 1:K) {
-    YS[,,k] <- scale(XS[,,k])
-  }
+  #==========================================================
+  # Standardization
+  #==========================================================
+  Y0 <- scale(X0)
+  YS <- lapply(XS, scale)
   
-  # Step 2: kernel density estimation: pre
-  # Step 3: weights estimation: pre
-
-  R_trans <- diag(1, p)
+  pair_id <- which(
+    lower.tri(matrix(0, p, p)),
+    arr.ind = TRUE
+  )
+  target_cross <- crossprod(Y0)
   
-  for (j in 1:(p - 1)) {
-    for (l in (j + 1):p) {
-      
-      fenzi.sum <- fenmu.sum <- rep(0, K)
-      
-      for (k in 1:K) {
-
-        err <- pre$errors[[j, l, k]]
-        weight <- pre$weights[, k, j, l]
-        
-        # sample selection
-        select.id1 <- which(abs(err$error_1) <= A)
-        select.id2 <- which(abs(err$eta) <= M)
-        id <- intersect(select.id1, select.id2)
-        
-        fenzi.sum[k] <- sum(YS[id, l, k] * weight[id] * YS[id, j, k])
-        fenmu.sum[k] <- sum(YS[id, l, k] * weight[id] * YS[id, l, k])
-      }
-      
-      # ETL-corr estimator construction
-      fenzi <- sum(fenzi.sum) + pre$Yt_cross[j, l]
-      fenmu <- sum(fenmu.sum) + pre$Yt_cross[l, l]
-      R_trans[j, l] <- fenzi / fenmu
-      R_trans[l, j] <- R_trans[j, l]
-    }
-  }
-
-  R_trans = fit.def.sym(R_trans)
-  return(R_trans)
-}
-
-# ETL-Scor via hard-thresholding
-fit.ETL.Scor = function(R_trans,lambda){
+  #==========================================================
+  # A2: precomputed once per source and coordinate
+  #==========================================================
+  A2_list <- lapply(YS, function(Yk) {
+    apply(abs(Yk), 2, quantile, probs = c_A2, names = FALSE)
+  })
   
-  R_strans = R_trans
+  #==========================================================
+  # Target-only cross-validation splits
+  #==========================================================
+  fold_id <- sample(rep(seq_len(cv_folds), length.out = nrow(X0)))
+  cv_target_cross <- vector("list", cv_folds)
+  cv_valid_cross <- vector("list", cv_folds)
+  cv_R_t_initial <- vector("list", cv_folds)
+  
+  for (f in seq_len(cv_folds)) {
+    Xtr <- X0[fold_id != f, , drop = FALSE]
+    Xva <- X0[fold_id == f, , drop = FALSE]
     
-    for (j in 1:(p - 1)) {
-      for (l in (j + 1):p) {
-        
-        if(abs(R_strans[j,l]) < lambda){R_strans[j,l] = R_strans[l,j] = 0}
-        
-      }
-    }
-  
-  return(R_strans)
+    Ytr <- scale(Xtr)
+    Yva <- scale(
+      Xva,
+      center = attr(Ytr, "scaled:center"),
+      scale = attr(Ytr, "scaled:scale")
+    )
+    
+    cv_target_cross[[f]] <- crossprod(Ytr)
+    cv_valid_cross[[f]] <- crossprod(Yva)
+    cv_R_t_initial[[f]] <- fit.domain.scor(Xtr, corr = TRUE)
   }
-
-# Tranfer-enhanced variance estimation
-fit.1st.moment.trans = function(Xt,XS,A1,M1){
   
-  n0 = nrow(Xt)
-  n1 = nrow(XS[,,1])
-  p = ncol(Xt)
-  K = dim(XS)[3]
-  
-  # initial estimators
-  mean.t.hat = colMeans(Xt)
-  mean.s.hat = matrix(0,p,K)
-  for (k in 1:K) {mean.s.hat[,k] = colMeans(XS[,,k])}
-  
-  # Transfer-enhanced mean estimation
-  mean.trans = rep(0,p)
-  
-  for (j in 1:p) {
+  #==========================================================
+  # One pair: all M values and all CV folds together
+  #==========================================================
+  fit_one_pair <- function(ii) {
+    j <- pair_id[ii, 1]
+    l <- pair_id[ii, 2]
     
-    eta = mean.t.hat[j] - mean.s.hat[j,]
-    kp.id = which(abs(eta) <= M1)
+    # Configuration 1 is the full-data fit; 2,... are CV folds.
+    rho_target <- c(
+      R_t_initial[j, l],
+      vapply(cv_R_t_initial, function(R) R[j, l], numeric(1))
+    )
+    target_num <- c(
+      target_cross[l, j],
+      vapply(cv_target_cross, function(G) G[l, j], numeric(1))
+    )
+    target_den <- c(
+      target_cross[l, l],
+      vapply(cv_target_cross, function(G) G[l, l], numeric(1))
+    )
+    nc <- length(rho_target)
     
-    if(length(kp.id) == 0){
+    num <- matrix(rep(target_num, each = nM), nrow = nM)
+    den <- matrix(rep(target_den, each = nM), nrow = nM)
+    
+    for (k in seq_len(K)) {
+      yj <- YS[[k]][, j]
+      yl <- YS[[k]][, l]
+      nk <- length(yl)
+      rho_s <- R_s_initial[[k]][j, l]
       
-      mean.trans[j] = colMeans(Xt)[j]
+      error_1 <- yj - rho_s * yl
+      A1 <- as.numeric(quantile(
+        abs(error_1), probs = c_A1, names = FALSE
+      ))
+      A2 <- A2_list[[k]][l]
       
-    }else{
+      # First two selection constraints do not involve M.
+      base_id <- which(abs(error_1) <= A1 & abs(yl) <= A2)
+      if (!length(base_id)) next
       
-      if(length(kp.id) == 1){
+      # Retain the largest-M set for each target fit.
+      id_by_config <- lapply(rho_target, function(rho_t) {
+        base_id[
+          abs((rho_s - rho_t) * yl[base_id]) <= max_M
+        ]
+      })
+      union_id <- sort(unique(unlist(id_by_config, use.names = FALSE)))
+      if (!length(union_id)) next
+      
+      # Same source KDE and bandwidth as the original method.
+      Z <- cbind(error_1, yl)
+      H <- c_H * nk^(-1 / 3) * diag(c(
+        max(1 - rho_s^2, 1e-8), 1
+      ))
+      H <- H + 1e-8 * diag(2)
+      
+      # Evaluate denominator once per union observation.
+      # Evaluate numerator densities for all target fits.
+      eval_list <- list(cbind(error_1[union_id], yl[union_id]))
+      offset <- length(union_id)
+      start_num <- integer(nc)
+      
+      for (a in seq_len(nc)) {
+        ids <- id_by_config[[a]]
+        if (!length(ids)) next
         
-        XS.use = array(0,c(n1,p,1))
-        XS.use[,,1] = XS[,,1]
-      }else{
+        m <- length(ids)
+        error_0 <- yj[ids] - rho_target[a] * yl[ids]
+        start_num[a] <- offset
         
-        XS.use = XS[,,kp.id]
+        eval_list[[length(eval_list) + 1L]] <- cbind(
+          error_0, yl[ids]
+        )
+        eval_list[[length(eval_list) + 1L]] <- cbind(
+          -error_0, yl[ids]
+        )
+        offset <- offset + 2L * m
+      }
+      
+      f_all <- as.numeric(ks::kde(
+        x = Z,
+        H = H,
+        eval.points = do.call(rbind, eval_list),
+        binned = TRUE,
+        bgridsize = c(41, 41),
+        compute.cont = FALSE
+      )$estimate)
+      f_den <- pmax(f_all[seq_along(union_id)], density_floor)
+      
+      for (a in seq_len(nc)) {
+        ids <- id_by_config[[a]]
+        m <- length(ids)
+        if (!m) next
         
-        fenzi.sum = fenmu.sum = rep(0,length(kp.id))
+        s <- start_num[a]
+        f_num1 <- f_all[s + seq_len(m)]
+        f_num2 <- f_all[s + m + seq_len(m)]
+        weight <- (f_num1 + f_num2) /
+          (2 * f_den[match(ids, union_id)])
         
-        for (k in 1:length(kp.id)) {
-          
-          # the estimation of density functions
-          error_0 = XS.use[,j,k] - mean.t.hat[j]
-          error_1 = XS.use[,j,k] - mean.s.hat[j,k]
-          kde.fit = kde(x = error_1)
-          
-          # the estimation of importance weights
-          fenzi = (predict(kde.fit,x = error_0) +
-                     predict(kde.fit,x = -error_0))/2
-          fenmu = predict(kde.fit,x = error_1)
-          weight = fenzi/fenmu
-          
-          # sample selection
-          id = which(abs(error_1) <= A1)
-          
-          # weights estimator (mean estimation)
-          fenzi.sum[k] = sum(XS.use[id,j,k]*weight[id])
-          fenmu.sum[k] = sum(weight[id])
+        wxy <- weight * yj[ids] * yl[ids]
+        wyy <- weight * yl[ids]^2
+        delta_abs <- abs((rho_s - rho_target[a]) * yl[ids])
+        
+        for (b in seq_len(nM)) {
+          keep <- delta_abs <= M_grid[b]
+          num[b, a] <- num[b, a] + sum(wxy[keep])
+          den[b, a] <- den[b, a] + sum(wyy[keep])
         }
-        
-        mean.trans[j] = (sum(Xt[,j]) + sum(fenzi.sum))/(n0 + sum(fenmu.sum))
       }
     }
     
-  }
-  
-  return(mean.trans)
-}
-
-fit.2rd.moment.trans = function(Xt,XS,A2,M2){
-  
-  n0 = nrow(Xt)
-  n1 = nrow(XS[,,1])
-  p = ncol(Xt)
-  K = dim(XS)[3]
-  
-  m2.t.hat = moment(Xt,order = 2)
-  m2.s.hat = matrix(0,p,K)
-
-  for (k in 1:K) {m2.s.hat[,k] = moment(XS[,,k],order = 2)}
-  
-  # transfer-enhanced (2rd) moment estimation
-  m2.trans = rep(0,p)
-  
-  for (j in 1:p) {
-    
-    eta = m2.t.hat[j] - m2.s.hat[j,]
-    kp.id = which(abs(eta) <= M2)
-    
-    if(length(kp.id) == 0){
-      
-      m2.trans[j] = m2.t.hat[j]
-      
-    }else{
-      
-      if(length(kp.id) == 1){
-        
-        XS.use = array(0,c(n1,p,1))
-        XS.use[,,1] = XS[,,1]
-      }else{
-        
-        XS.use = XS[,,kp.id]
-      }
-      
-      fenzi.sum = fenmu.sum = rep(0,length(kp.id))
-      
-      for (k in 1:length(kp.id)) {
-        
-        # the estimation of density functions
-        error_0 = (XS.use[,j,k])^2 - m2.t.hat[j]
-        error_1 = (XS.use[,j,k])^2 - m2.s.hat[j,k]
-        kde.fit = kde(x = error_1)
-        
-        # the estimation of importance weights
-        fenzi = (predict(kde.fit,x = error_0) +
-                   predict(kde.fit,x = -error_0))/2
-        fenmu = predict(kde.fit,x = error_1)
-        weight = fenzi/fenmu
-        
-        # sample selection
-        id = which(abs(error_1) <= A2)
-        
-        # weights estimator (mean estimation)
-        fenzi.sum[k] = sum(((XS.use[id,j,k])^2)*weight[id])
-        fenmu.sum[k] = sum(weight[id])
-      }
-      
-      m2.trans[j] = (sum((Xt[,j])^2) + sum(fenzi.sum))/(n0 + sum(fenmu.sum))
+    # Validation prediction loss: Y_j predicted by rho * Y_l.
+    cv_loss <- numeric(nM)
+    for (f in seq_len(cv_folds)) {
+      rho_f <- num[, f + 1L] / den[, f + 1L]
+      G <- cv_valid_cross[[f]]
+      cv_loss <- cv_loss +
+        G[j, j] - 2 * rho_f * G[j, l] + rho_f^2 * G[l, l]
     }
     
+    list(
+      rho = num[, 1L] / den[, 1L],
+      H = den[, 1L],
+      cv_loss = cv_loss
+    )
   }
   
-  return(m2.trans)
+  #==========================================================
+  # Parallel cluster
+  #==========================================================
+  own_cluster <- FALSE
+  
+  if (is.null(cl) && ncores > 1L) {
+    cl <- parallel::makeCluster(ncores)
+    
+    user_lib <- path.expand("~/R/library")
+    parallel::clusterCall(cl, function(lib) {
+      .libPaths(c(lib, .libPaths()))
+      invisible(NULL)
+    }, user_lib)
+    
+    own_cluster <- TRUE
+  }
+  
+  on.exit({
+    if (own_cluster && !is.null(cl)) {
+      parallel::stopCluster(cl)
+    }
+  }, add = TRUE)
+  
+  #==========================================================
+  # Parallelization over pairs
+  #==========================================================
+  if (is.null(cl)) {
+    pair_fit <- lapply(seq_len(nrow(pair_id)), fit_one_pair)
+  } else {
+    parallel::clusterExport(
+      cl,
+      varlist = c(
+        "YS", "R_t_initial", "R_s_initial", "pair_id",
+        "target_cross", "A2_list", "K", "c_A1",
+        "M_grid", "max_M", "nM", "c_H", "density_floor",
+        "cv_target_cross", "cv_valid_cross", "cv_R_t_initial",
+        "cv_folds", "fit_one_pair"
+      ),
+      envir = environment()
+    )
+    
+    pair_fit <- parallel::parLapplyLB(
+      cl, seq_len(nrow(pair_id)), fit_one_pair
+    )
+  }
+  
+  #==========================================================
+  # Choose M by target CV prediction loss
+  #==========================================================
+  cv_loss <- Reduce(`+`, lapply(pair_fit, `[[`, "cv_loss")) /
+    (nrow(X0) * nrow(pair_id))
+  names(cv_loss) <- as.character(M_grid)
+  best <- which.min(cv_loss)
+  M_selected <- M_grid[best]
+  
+  #==========================================================
+  # Collect the full-data fit for the selected M
+  #==========================================================
+  rho_pair <- vapply(pair_fit, function(z) z$rho[best], numeric(1))
+  H_pair <- vapply(pair_fit, function(z) z$H[best], numeric(1))
+  
+  R_hat <- diag(p)
+  for (ii in seq_len(nrow(pair_id))) {
+    j <- pair_id[ii, 1]
+    l <- pair_id[ii, 2]
+    R_hat[j, l] <- rho_pair[ii]
+    R_hat[l, j] <- rho_pair[ii]
+  }
+  
+  H_min <- min(H_pair)
+  
+  list(
+    R_hat = R_hat,
+    H_min = H_min,
+    rho_pair = rho_pair,
+    H_pair = H_pair,
+    pair_id = pair_id,
+    M_selected = M_selected,
+    M_grid = M_grid,
+    cv_loss = cv_loss
+  )
 }
 
-fit.ETL.var = function(Xt,XS,A1,M1,A2,M2){
+#============================================================
+# Sparse ETL-corr
+#============================================================
+
+fit.ETL.Scor <- function(
+    R_hat,
+    H_min,
+    c_T = 1) {
   
-  m1.trans.hat = fit.1st.moment.trans(Xt,XS,A1,M1)
-  m2.trans.hat = fit.2rd.moment.trans(Xt,XS,A2,M2)
+  p <- ncol(R_hat)
   
-  ETL.var.hat = m2.trans.hat - m1.trans.hat^2
+  threshold <-
+    c_T *
+    sqrt(
+      log(p) / H_min
+    )
   
-  return(ETL.var.hat)
+  R_scor <- R_hat
+  
+  id <- upper.tri(
+    R_scor
+  )
+  
+  R_scor[
+    id &
+      abs(R_scor) < threshold
+  ] <- 0
+  
+  
+  # Enforce symmetry
+  R_scor[
+    lower.tri(R_scor)
+  ] <-
+    t(R_scor)[
+      lower.tri(R_scor)
+    ]
+  
+  diag(R_scor) <- 1
+  return(R_scor)
 }
 
-
-
-
+fit.domain.scor = function(X, corr = TRUE){
+  
+  sigma.hat = cov(X)
+  p = ncol(X)
+  
+  c_T = 1
+  threshold <-
+    c_T *
+    sqrt(
+      log(p) / nrow(X)
+    )
+  sigma.thre.hat = sigma.hat
+  sigma.thre.hat[which(abs(sigma.hat) < threshold)] = 0
+  
+  if(corr == TRUE){
+    R.thre.hat = cov2cor(sigma.thre.hat)
+  }else{
+    
+    R.thre.hat = sigma.thre.hat
+  }
+  
+  return(R.thre.hat)
+}
