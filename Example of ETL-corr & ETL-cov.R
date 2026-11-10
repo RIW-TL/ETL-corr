@@ -1,181 +1,498 @@
+library(ks)
+library(parallel)
 
-source("Main-functions.R")
-#--------------------------------------------
-
-# settings (as an example)
-#--------------------------------------------
-n0 = 100;n1 = 500;p = 100;K = 5;case = 1
-num.info = 2;d = 8
-
-# data generation
-#-------------------------------------------
-data = dat.g(n0,n1,p,num.info,K,d,case,s = 10)
-Xt = data$Xt 
-XS = data$XS
-
-Sig_t = data$Sig_t
-# Sig_s = data$Sig_s
-
-diag.elements = diag(Sig_t)
-R_t = diag(diag.elements^{-1/2}) %*% Sig_t %*% diag(diag.elements^{-1/2})
-
-R_s = array(0,c(p,p,K))
-for (k in 1:K) {
+ETL_var <- function(
+    X0,
+    XS,
+    A_grid = c(2.5, 3, 3.5,4),
+    M_grid = c(0.2, 0.4,0.6,0.8,1),
+    nfold = 5,
+    ncores = 8,
+    seed = 1,
+    cl = NULL
+) {
   
-  diag.elements = diag(Sig_s[,,k])
-  R_s[,,k] = diag(diag.elements^{-1/2}) %*% Sig_s[,,k] %*% diag(diag.elements^{-1/2})
+  #============================================================
+  # Basic setup
+  #============================================================
+  
+  if (!requireNamespace("ks", quietly = TRUE)) {
+    stop("Please install the 'ks' package.")
+  }
+  
+  X0 <- as.matrix(X0)
+  XS <- lapply(XS, as.matrix)
+  
+  n0 <- nrow(X0)
+  p  <- ncol(X0)
+  
+  A_grid <- sort(unique(as.numeric(A_grid)))
+  M_grid <- sort(unique(as.numeric(M_grid)))
+  
+  if (length(XS) == 0L) {
+    stop("XS must be a nonempty list.")
+  }
+  
+  if (any(vapply(XS, ncol, integer(1)) != p)) {
+    stop("X0 and all source matrices must have the same number of columns.")
+  }
+  
+  if (nfold < 2L || nfold >= n0) {
+    stop("nfold must satisfy 2 <= nfold < nrow(X0).")
+  }
+  
+  
+  #============================================================
+  # Candidate (A, M) combinations
+  #============================================================
+  
+  param_grid <- expand.grid(
+    A = A_grid,
+    M = M_grid
+  )
+  
+  n_param <- nrow(param_grid)
+  
+  
+  #============================================================
+  # Five-fold split
+  #============================================================
+  
+  set.seed(seed)
+  
+  fold_id <- sample(
+    rep(seq_len(nfold), length.out = n0)
+  )
+  
+  folds <- lapply(
+    seq_len(nfold),
+    function(f) {
+      list(
+        train = which(fold_id != f),
+        val   = which(fold_id == f)
+      )
+    }
+  )
+  
+  
+  #============================================================
+  # One coordinate
+  #============================================================
+  
+  fit_coordinate <- function(j) {
+    
+    x0 <- X0[, j]
+    
+    
+    #----------------------------------------------------------
+    # Source quantities
+    #----------------------------------------------------------
+    
+    source_info <- lapply(
+      XS,
+      function(Xk) {
+        
+        xk <- Xk[, j]
+        uk <- xk - mean(xk)
+        
+        list(
+          uk   = uk,
+          vk   = var(xk),
+          fhat = ks::kde(x = uk)
+        )
+      }
+    )
+    
+    
+    #==========================================================
+    # ETL-var estimator
+    #==========================================================
+    
+    estimate_var <- function(
+    x_target,
+    A,
+    M) {
+      
+      nt <- length(x_target)
+      v0 <- var(x_target)
+      
+      if (!is.finite(v0) || v0 <= 0) {
+        return(NA_real_)
+      }
+      
+      target_sum <- nt * v0
+      
+      source_sum        <- 0
+      source_weight_sum <- 0
+      
+      
+      for (k in seq_along(source_info)) {
+        
+        uk   <- source_info[[k]]$uk
+        vk   <- source_info[[k]]$vk
+        fhat <- source_info[[k]]$fhat
+        
+        
+        #------------------------------------------------------
+        # Source-level screening
+        #------------------------------------------------------
+        
+        variance_ratio <- vk / v0
+        
+        if (!is.finite(variance_ratio) ||
+            abs(variance_ratio - 1) > M) {
+          next
+        }
+        
+        
+        #------------------------------------------------------
+        # Residual truncation
+        #------------------------------------------------------
+        
+        id <- which(
+          abs(uk) <= A
+        )
+        
+        if (length(id) == 0L) {
+          next
+        }
+        
+        u <- uk[id]
+        
+        
+        #------------------------------------------------------
+        # Density-ratio weight
+        #------------------------------------------------------
+        
+        rho_hat <- sqrt(
+          variance_ratio
+        )
+        
+        denominator <- as.numeric(
+          predict(
+            fhat,
+            x = u
+          )
+        )
+        
+        numerator <- rho_hat *
+          as.numeric(
+            predict(
+              fhat,
+              x = rho_hat * u
+            )
+          )
+        
+        weight <- numerator / denominator
+        
+        valid <- is.finite(weight)
+        
+        if (!any(valid)) {
+          next
+        }
+        
+        u      <- u[valid]
+        weight <- weight[valid]
+        
+        
+        #------------------------------------------------------
+        # Source contribution
+        #------------------------------------------------------
+        
+        source_sum <- source_sum +
+          sum(weight * u^2)
+        
+        source_weight_sum <- source_weight_sum +
+          sum(weight)
+      }
+      
+      
+      #--------------------------------------------------------
+      # ETL variance
+      #--------------------------------------------------------
+      
+      out <-
+        (target_sum + source_sum) /
+        (nt + source_weight_sum)
+      
+      if (!is.finite(out) || out <= 0) {
+        return(NA_real_)
+      }
+      
+      out
+    }
+    
+    
+    #==========================================================
+    # Cross-validation over (A, M)
+    #==========================================================
+    
+    cv_loss <- rep(
+      Inf,
+      n_param
+    )
+    
+    for (g in seq_len(n_param)) {
+      
+      A <- param_grid$A[g]
+      M <- param_grid$M[g]
+      
+      loss_sum <- 0
+      n_val_sum <- 0
+      
+      
+      for (f in seq_len(nfold)) {
+        
+        train_id <- folds[[f]]$train
+        val_id   <- folds[[f]]$val
+        
+        x_train <- x0[train_id]
+        x_val   <- x0[val_id]
+        
+        
+        #------------------------------------------------------
+        # Estimate variance using training target data
+        #------------------------------------------------------
+        
+        v_hat <- estimate_var(
+          x_target = x_train,
+          A = A,
+          M = M
+        )
+        
+        if (!is.finite(v_hat) ||
+            v_hat <= 0) {
+          
+          loss_sum <- Inf
+          break
+        }
+        
+        
+        #------------------------------------------------------
+        # Validation loss
+        #------------------------------------------------------
+        
+        mu_train <- mean(
+          x_train
+        )
+        
+        loss_f <-
+          log(v_hat) +
+          (x_val - mu_train)^2 / v_hat
+        
+        loss_sum <- loss_sum +
+          sum(loss_f)
+        
+        n_val_sum <- n_val_sum +
+          length(x_val)
+      }
+      
+      
+      if (is.finite(loss_sum)) {
+        
+        cv_loss[g] <-
+          loss_sum /
+          n_val_sum
+      }
+    }
+    
+    
+    #==========================================================
+    # Full-data estimators for all (A, M)
+    #==========================================================
+    
+    full_hat <- vapply(
+      seq_len(n_param),
+      function(g) {
+        
+        estimate_var(
+          x_target = x0,
+          A = param_grid$A[g],
+          M = param_grid$M[g]
+        )
+      },
+      numeric(1)
+    )
+    
+    
+    list(
+      cv_loss = cv_loss,
+      full_hat = full_hat
+    )
+  }
+  
+  
+  #============================================================
+  # Parallel cluster
+  #============================================================
+  
+  own_cluster <- FALSE
+  
+  if (is.null(cl) && ncores > 1L) {
+    
+    cl <- parallel::makeCluster(
+      min(ncores, p)
+    )
+    
+    master_lib <- .libPaths()
+    
+    parallel::clusterCall(
+      cl,
+      function(lib) {
+        .libPaths(c(lib, .libPaths()))
+        invisible(NULL)
+      },
+      master_lib
+    )
+    
+    own_cluster <- TRUE
+  }
+  
+  
+  on.exit(
+    {
+      if (own_cluster && !is.null(cl)) {
+        parallel::stopCluster(cl)
+      }
+    },
+    add = TRUE
+  )
+  
+  
+  #============================================================
+  # Parallel over coordinates
+  #============================================================
+  
+  if (is.null(cl)) {
+    
+    fit_list <- lapply(
+      seq_len(p),
+      fit_coordinate
+    )
+    
+  } else {
+    
+    parallel::clusterExport(
+      cl,
+      varlist = c(
+        "X0",
+        "XS",
+        "A_grid",
+        "M_grid",
+        "param_grid",
+        "n_param",
+        "nfold",
+        "folds",
+        "fit_coordinate"
+      ),
+      envir = environment()
+    )
+    
+    fit_list <- parallel::parLapply(
+      cl,
+      seq_len(p),
+      fit_coordinate
+    )
+  }
+  
+  
+  #============================================================
+  # Global CV criterion
+  #============================================================
+  
+  cv_loss_coordinate <- do.call(
+    rbind,
+    lapply(
+      fit_list,
+      function(z) {
+        z$cv_loss
+      }
+    )
+  )
+  
+  
+  cv_loss <- colMeans(
+    cv_loss_coordinate
+  )
+  
+  
+  #============================================================
+  # Select optimal (A, M)
+  #============================================================
+  
+  best_id <- which.min(
+    cv_loss
+  )
+  
+  A_hat <- param_grid$A[
+    best_id
+  ]
+  
+  M_hat <- param_grid$M[
+    best_id
+  ]
+  
+  
+  #============================================================
+  # Final ETL-var
+  #============================================================
+  
+  ETL_var_hat <- vapply(
+    fit_list,
+    function(z) {
+      z$full_hat[best_id]
+    },
+    numeric(1)
+  )
+  
+  
+  #============================================================
+  # CV loss matrix
+  #
+  # rows    = A
+  # columns = M
+  #============================================================
+  
+  cv_loss_matrix <- matrix(
+    NA_real_,
+    nrow = length(A_grid),
+    ncol = length(M_grid),
+    dimnames = list(
+      paste0("A=", A_grid),
+      paste0("M=", M_grid)
+    )
+  )
+  
+  for (g in seq_len(n_param)) {
+    
+    a_id <- match(
+      param_grid$A[g],
+      A_grid
+    )
+    
+    m_id <- match(
+      param_grid$M[g],
+      M_grid
+    )
+    
+    cv_loss_matrix[
+      a_id,
+      m_id
+    ] <- cv_loss[g]
+  }
+  
+  
+  #============================================================
+  # Output
+  #============================================================
+  
+  list(
+    ETL_var_hat = ETL_var_hat,
+    A_hat = A_hat,
+    M_hat = M_hat,
+    cv_loss = cv_loss_matrix,
+    A_grid = A_grid,
+    M_grid = M_grid,
+    cv_loss_coordinate = cv_loss_coordinate
+  )
 }
-
-#==================================cor============================
-#---------------------------------------------------------------
-
-# Target-corr
-#------------------
-Target_corr_hat = cor(Xt)
-
-# Target-Scor
-#------------------
-Target_Scor_hat = est_sparseCov(Xt, method = 'cv', operator = 'hard', corr = T)
-
-# Pool-corr
-#-----------------
-X.A = c()
-for (k in 1:K) {X.A = rbind(X.A, XS[,,k])}
-sum.X = rbind(Xt,X.A)
-Pool_corr_hat = cor(sum.X)
-
-# ETL-corr
-#------------------
-R_t_hat = Target_corr_hat
-R_s_hat = array(0,c(p,p,K))
-for (k in 1:K) {R_s_hat[,,k] = cor(XS[,,k])}
-
-pre <- pre_compute(Xt, XS, R_t_hat, R_s_hat)
-ETL_corr_hat = fit.ETL.corr(Xt, XS, A = 0.5, M = 0.4, R_t_hat, R_s_hat,pre)
-
-#---------------------------------------------------------
-# A.range = seq(0.3,0.9,0.3)
-# M.range = c(0.05,seq(0.1,0.5,0.1))
-# cv.loss.F = matrix(0, length(A.range), length(M.range))
-# 
-# for (ir in seq_along(A.range)) {
-#   for (im in seq_along(M.range)) {
-#     
-#     A = A.range[ir]
-#     M = M.range[im]
-#     
-#     l = (ir - 1)*length(M.range) + im
-#     out = fit.ETL.corr(Xt, XS, K, A, M, R_t_hat, R_s_hat,pre)
-#     cv.loss.F[ir,im] <- norm(out - R_t, "F")^2/p
-#   }
-# }
-# cv.loss.F
-#---------------------------------------------------------
-
-
-# ETL-Scor 
-#-----------------
-ETL_Scor_hat = fit.ETL.Scor(R_trans = ETL_corr_hat,lambda = 0.1)
-
-
-#-----------------------------------------------------
-# lambda.range = seq(0.01,0.1,0.02)
-# cv.loss.F = rep(0,length(lambda.range))
-# 
-# for (m in 1:length(lambda.range)) {
-#   
-#   lambda = lambda.range[m]
-#   cv.SECM = fit.ETL.Scor(R_trans = ETL_corr_hat,lambda = 0.1)
-#   
-#   cv.loss.F[m] = norm(cv.SECM - R_t,"F")^2/p
-# }
-# cv.loss.F
-#----------------------------------------------------
-
-
-error.F = matrix(0,1,5)
-colnames(error.F) = c("ETL-corr","ETL-Scor","Pool-corr",
-                      "Target-corr","Target-Scor")
-error.F[1,] = c(norm(ETL_corr_hat - R_t,"F")^2/p,
-                norm(ETL_Scor_hat - R_t,"F")^2/p,
-                norm(Pool_corr_hat - R_t,"F")^2/p,
-                norm(Target_corr_hat - R_t,"F")^2/p,
-                norm(Target_Scor_hat - R_t,"F")^2/p);error.F
-
-
-#==========================var==============================
-#===========================================================
-
-# Taget-var
-#------------------------------
-target.var.hat = diag(cov(Xt))
-
-# Pool
-#------------------------------
-pool.var.hat = diag(cov(sum.X))
-
-# ETL-var
-#-------------------------------
-ETL.var.hat = fit.ETL.var(Xt,XS,A1 = 0.5,M1 = 0.3,A2 = 0.3,M2 = 0.5)
-
-#-------------------------------------------------------
-# A.range = seq(0.3,0.9,0.3)
-# M.range = seq(0.2,1,0.1)
-# cv.loss = matrix(0,length(A.range),length(M.range))
-# for (a in 1:length(A.range)) {
-#   for (m in 1:length(M.range)) {
-#     
-#     A2 = A.range[a]
-#     M2 = M.range[m]
-#     
-#     m.trans.hat = fit.2rd.moment.trans(Xt,XS,K,A2,M2)
-#     
-#     # cv.loss[a,m] = sum((m.trans.hat)^2)
-#     cv.loss[a,m] = sum((m.trans.hat - diag(Sig_t))^2)
-#   }
-# }
-# cv.loss
-#--------------------------------------------------------
-
-
-#-------------------------------
-error.var = matrix(0,1,3)
-colnames(error.var) = c("Target-var","Pool-var","ETL-var")
-error.var[1,] = c(sum((target.var.hat - diag(Sig_t))^2),
-              sum((pool.var.hat - diag(Sig_t))^2),
-              sum((ETL.var.hat - diag(Sig_t))^2));error.var
-
-#==========================cov==============================
-#===========================================================
-
-# Target-cov
-#------------------
-target_cov_hat = cov(Xt)
-
-# Target-Scov
-#------------------
-target_Scov_hat = est_sparseCov(Xt, method = 'cv', operator = 'hard', corr = T)
-
-
-# ETL-cov 
-#------------------
-ETL_cov_hat = diag(ETL.var.hat^{1/2}) %*% ETL_corr_hat %*% diag(ETL.var.hat^{1/2})
-
-# ETL-Scov
-#-----------------
-ETL_Scov_hat = diag(ETL.var.hat^{1/2}) %*% ETL_Scor_hat %*% diag(ETL.var.hat^{1/2})
-
-# pool
-#-----------------
-pool_cov_hat = cov(sum.X)
-
-#------------------------------------------
-
-error.cov.F = matrix(0,1,5)
-colnames(error.cov.F) = c("ETL-cov","ETL-Scov","Pool-cov","Target-Scov","Target-cov")
-error.cov.F[1,] = c(norm(ETL_cov_hat - Sig_t,"F")^2/p,
-                norm(ETL_Scov_hat - Sig_t,"F")^2/p,
-                norm(pool_cov_hat - Sig_t,"F")^2/p,
-                norm(target_Scov_hat - Sig_t,"F")^2/p,
-                norm(target_cov_hat - Sig_t,"F")^2/p);error.cov.F
-
